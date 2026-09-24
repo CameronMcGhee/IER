@@ -1,0 +1,127 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r}
+# Author: Cameron McGhee
+
+  library(tidyverse)
+  library(boot)
+  library(scales)
+
+box_path <- "NBA2024.csv"
+def_path <- "team_def_rating_2024.csv"
+
+box <- read_csv(box_path, show_col_types = FALSE)
+def <- read_csv(def_path, show_col_types = FALSE)
+
+
+league_def_avg <- def$opp_def_rating %>% mean(na.rm = TRUE)
+
+box <- box %>%
+  left_join(def, by = "opponent") %>%
+  mutate(
+    MissedFG = pmax(FGA - FGM, 0),
+    OppEffAdj = league_def_avg / opp_def_rating
+  )
+
+
+compute_poss_used <- function(df) {
+  df %>% mutate(
+    Poss_used = FGA + 0.44*FTA + TOV + 0.2*AST + 0.5*OREB + 0.5*(STL + BLK),
+    Poss_used = if_else(Poss_used <= 0, NA_real_, Poss_used)
+  )
+}
+
+compute_IER <- function(df) {
+  df %>%
+    compute_poss_used() %>%
+    mutate(
+      IER_raw = (PTS + 1.5*AST + 1.2*OREB + 1.3*STL + 1.5*BLK - 1.2*TOV - 0.8*MissedFG - 0.5*PF) / Poss_used,
+      IER = IER_raw * OppEffAdj
+    )
+}
+
+ier_df <- compute_IER(box)
+
+
+boot_IER_player <- function(player_row, R = 1000) {
+
+  set.seed(42)
+  comps <- c("PTS","AST","OREB","STL","BLK","TOV","MissedFG","PF","FGA","FTA")
+  vals  <- as.numeric(player_row[comps])
+  names(vals) <- comps
+  OppEffAdj <- as.numeric(player_row["OppEffAdj"])
+  if (any(is.na(vals)) || is.na(OppEffAdj)) return(c(NA, NA, NA))
+
+  sim_IER <- numeric(R)
+  for (r in seq_len(R)) {
+    sim <- rpois(length(vals), lambda = pmax(vals, 0))
+    names(sim) <- comps
+    Poss_used <- sim["FGA"] + 0.44*sim["FTA"] + sim["TOV"] + 0.2*sim["AST"] + 0.5*sim["OREB"] + 0.5*(sim["STL"] + sim["BLK"])
+    if (Poss_used <= 0) {
+      sim_IER[r] <- NA_real_
+    } else {
+      IER_raw <- (sim["PTS"] + 1.5*sim["AST"] + 1.2*sim["OREB"] + 1.3*sim["STL"] + 1.5*sim["BLK"] - 1.2*sim["TOV"] - 0.8*sim["MissedFG"] - 0.5*sim["PF"]) / Poss_used
+      sim_IER[r] <- IER_raw * OppEffAdj
+    }
+  }
+  c(mean = mean(sim_IER, na.rm = TRUE),
+    lo = quantile(sim_IER, 0.025, na.rm = TRUE),
+    hi = quantile(sim_IER, 0.975, na.rm = TRUE))
+}
+
+boot_res <- ier_df %>%
+  rowwise() %>%
+  mutate(
+    IER_boot_stats = list(boot_IER_player(cur_data()))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    IER_boot_mean = map_dbl(IER_boot_stats, 1),
+    IER_boot_lo   = map_dbl(IER_boot_stats, 2),
+    IER_boot_hi   = map_dbl(IER_boot_stats, 3)
+  ) %>%
+  select(-IER_boot_stats)
+
+
+cor_results <- list()
+if (all(c("PER","WS48") %in% names(boot_res))) {
+  cor_results$IER_PER  <- cor(boot_res$IER,  boot_res$PER,  use = "complete.obs")
+  cor_results$IER_WS48 <- cor(boot_res$IER,  boot_res$WS48, use = "complete.obs")
+} else if ("PER" %in% names(boot_res)) {
+  cor_results$IER_PER  <- cor(boot_res$IER,  boot_res$PER,  use = "complete.obs")
+}
+print(cor_results)
+
+
+# Figure 1: PER vs IER
+if ("PER" %in% names(boot_res)) {
+  p1 <- ggplot(boot_res, aes(x = PER, y = IER, label = player)) +
+    geom_point(size = 3, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_text(nudge_y = 0.02, size = 3, alpha = 0.7) +
+    labs(title = "Comparing IER and PER",
+         x = "Player Efficiency Rating (PER)",
+         y = "Impact Efficiency Rating (IER)") +
+    theme_minimal(base_size = 13)
+}
+p1
+
+# Figure 2: Top players by IER with 95% CI
+top_n <- 10
+p2 <- boot_res %>%
+  arrange(desc(IER)) %>%
+  slice_head(n = top_n) %>%
+  ggplot(aes(x = reorder(player, IER), y = IER)) +
+  geom_col(alpha = 0.9) +
+  geom_errorbar(aes(ymin = IER_boot_lo, ymax = IER_boot_hi), width = 0.2) +
+  coord_flip() +
+  labs(title = "Top Players by Impact Efficiency Rating (IER)",
+       x = "Player",
+       y = "IER (with 95% bootstrap CI)") +
+  theme_minimal(base_size = 13)
+
+p2
+
